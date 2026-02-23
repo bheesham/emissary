@@ -60,6 +60,7 @@ use iced::{
 use tokio::sync::mpsc::Sender;
 
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
@@ -351,19 +352,25 @@ impl RouterUi {
         router_id: RouterId,
         shutdown_tx: Sender<()>,
     ) -> anyhow::Result<()> {
-        iced::application("emissary", RouterUi::update, RouterUi::view)
+        // Upstream: https://github.com/iced-rs/iced/issues/3080
+        // Adapted from: https://discourse.iced.rs/t/solved-new-boot-trait-no-longer-able-to-use-a-capturing-closure-to-initialize-application-state/1012/6
+        let boot_once = RefCell::new(Some(RouterUi::new(
+            events,
+            config,
+            base_path,
+            address_book_handle,
+            router_id,
+            shutdown_tx,
+        )));
+        let boot = move || match boot_once.borrow_mut().take() {
+            Some(v) => v,
+            None => panic!("at the disco"),
+        };
+        iced::application(boot, RouterUi::update, RouterUi::view)
+            .title("emissary")
             .subscription(RouterUi::subscription)
             .theme(RouterUi::theme)
-            .run_with(move || {
-                RouterUi::new(
-                    events,
-                    config,
-                    base_path,
-                    address_book_handle,
-                    router_id,
-                    shutdown_tx,
-                )
-            })
+            .run()
             .map_err(From::from)
     }
 
