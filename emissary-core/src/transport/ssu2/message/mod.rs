@@ -29,13 +29,16 @@ use crate::{
     i2np::{Message, MessageType as I2npMessageType},
     primitives::{MessageId, RouterId, RouterInfo},
     runtime::Runtime,
-    transport::ssu2::peer_test::types::RejectionReason,
+    transport::ssu2::{
+        peer_test::types::RejectionReason as PeerTestRejectionReason,
+        relay::types::RejectionReason as RelayRejectionReason,
+    },
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
 use nom::{
     bytes::complete::take,
-    number::complete::{be_u16, be_u32, be_u64, be_u8},
+    number::complete::{be_u16, be_u32, be_u64, be_u8, le_u64},
     Err, IResult,
 };
 use rand::Rng;
@@ -88,6 +91,9 @@ const ROUTER_HASH_LEN: usize = 32usize;
 
 /// Ed25519 signature length.
 const ED25519_SIGNATURE_LEN: usize = 64usize;
+
+/// Token length.
+const TOKEN_LEN: usize = 8usize;
 
 /// SSU2 block type.
 #[derive(Debug)]
@@ -220,7 +226,7 @@ pub enum PeerTestMessage {
         /// Rejection reason from Charlie, if request was not accepted.
         ///
         /// `None` if requested was accepted.
-        rejection: Option<RejectionReason>,
+        rejection: Option<PeerTestRejectionReason>,
 
         /// Signature.
         signature: Vec<u8>,
@@ -236,7 +242,7 @@ pub enum PeerTestMessage {
         /// Rejection reason from Bob/Charlie, if request was not accepted.
         ///
         /// `None` if requested was accepted.
-        rejection: Option<RejectionReason>,
+        rejection: Option<PeerTestRejectionReason>,
 
         /// Router hash.
         ///
@@ -366,19 +372,74 @@ pub enum Block {
     },
 
     /// Relay request.
-    #[allow(unused)]
-    RelayRequest {},
+    RelayRequest {
+        /// Random nonce
+        nonce: u32,
+
+        /// Relay tag from Charlie's router info.
+        relay_tag: u32,
+
+        /// Alice's socket address.
+        address: SocketAddr,
+
+        /// Message, i.e., the part of `RelayRequest` covered by `signature`.
+        message: Vec<u8>,
+
+        /// Signature for `message`.
+        signature: Vec<u8>,
+    },
 
     /// Relay response.
-    #[allow(unused)]
-    RelayResponse {},
+    RelayResponse {
+        /// Random nonce.
+        nonce: u32,
+
+        /// Charlie's socket address, if accepted.
+        address: Option<SocketAddr>,
+
+        /// Token used in `SessionRequest` by Alice, if accepted.
+        token: Option<u64>,
+
+        /// Rejection.
+        ///
+        /// `None` if accepted.
+        rejection: Option<RelayRejectionReason>,
+
+        /// Message, i.e., the part of `RelayResponse` covered by `signature`.
+        message: Vec<u8>,
+
+        /// Signature for `message`.
+        ///
+        /// `None` if rejected by Bob.
+        signature: Option<Vec<u8>>,
+    },
 
     /// Relay intro.
-    #[allow(unused)]
-    RelayIntro {},
+    RelayIntro {
+        /// Alice's router ID.
+        router_id: RouterId,
+
+        /// Random nonce.
+        nonce: u32,
+
+        /// Relay tag.
+        relay_tag: u32,
+
+        /// Alice's socket address.
+        address: SocketAddr,
+
+        /// Message received from Alice.
+        message: Vec<u8>,
+
+        /// Signature for `message`.
+        signature: Vec<u8>,
+    },
 
     /// Peer test.
-    PeerTest { message: PeerTestMessage },
+    PeerTest {
+        /// Peer test message.
+        message: PeerTestMessage,
+    },
 
     /// Next nonce.
     #[allow(unused)]
@@ -405,12 +466,13 @@ pub enum Block {
     },
 
     /// Relay tag request.
-    #[allow(unused)]
-    RelayTagRequest {},
+    RelayTagRequest,
 
     /// Relay tag.
-    #[allow(unused)]
-    RelayTag {},
+    RelayTag {
+        /// Relay tag.
+        relay_tag: u32,
+    },
 
     /// New token.
     NewToken {
@@ -936,7 +998,7 @@ impl Block {
                 Block::PeerTest {
                     message: PeerTestMessage::Message3 {
                         nonce,
-                        rejection: (code != 0).then(|| RejectionReason::from(code)),
+                        rejection: (code != 0).then(|| PeerTestRejectionReason::from(code)),
                         // signature exists since it was extracted for message 4
                         signature: maybe_signature.expect("to exist").to_vec(),
                         message: {
@@ -958,7 +1020,7 @@ impl Block {
                         // router hash must exist since it was extracted for message 4
                         router_hash: router_hash.expect("to exist").to_vec(),
                         nonce,
-                        rejection: (code != 0).then(|| RejectionReason::from(code)),
+                        rejection: (code != 0).then(|| PeerTestRejectionReason::from(code)),
                         // signature must exist since it was extracted for message 4
                         signature: maybe_signature.expect("to exist").to_vec(),
                         message: {
@@ -1034,6 +1096,218 @@ impl Block {
         ))
     }
 
+    /// Parse [`MessageBlock::RelayTagRequest`].
+    fn parse_relay_tag_request(input: &[u8]) -> IResult<&[u8], Block, Ssu2ParseError> {
+        let (rest, _size) = be_u16(input)?;
+
+        Ok((rest, Block::RelayTagRequest))
+    }
+
+    /// Parse [`MessageBlock::RelayRequest`].
+    fn parse_relay_request(input: &[u8]) -> IResult<&[u8], Block, Ssu2ParseError> {
+        let (rest, _size) = be_u16(input)?;
+        let (rest, _flag) = be_u8(rest)?;
+
+        // keep track of message start so it can be sent unmodified to alice/charlie
+        //
+        // <https://i2p.net/en/docs/specs/ssu2/#relayrequest>
+        let message_start = rest;
+
+        let (rest, nonce) = be_u32(rest)?;
+        let (rest, relay_tag) = be_u32(rest)?;
+        let (rest, _timestamp) = be_u32(rest)?;
+        let (rest, _version) = be_u8(rest)?;
+        let (rest, address_size) = be_u8(rest)?;
+        let (rest, address) = match address_size {
+            6 => {
+                let (rest, port) = be_u16(rest)?;
+                let (rest, address) = be_u32(rest)?;
+
+                (
+                    rest,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(address), port)),
+                )
+            }
+            18 => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "ipv6 not supported"
+                );
+                return Err(Err::Error(Ssu2ParseError::InvalidBitstream));
+            }
+            _ => return Err(Err::Error(Ssu2ParseError::InvalidBitstream)),
+        };
+        let (rest, signature) = take(ED25519_SIGNATURE_LEN)(rest)?;
+
+        Ok((
+            rest,
+            Block::RelayRequest {
+                nonce,
+                relay_tag,
+                address,
+                message: {
+                    let message_end =
+                        4usize // nonce
+                            .saturating_add(4) // relay tag
+                            .saturating_add(4) // timestamp
+                            .saturating_add(1) // version
+                            .saturating_add(1) // address size
+                            .saturating_add(address_size as usize);
+
+                    message_start[..message_end].to_vec()
+                },
+                signature: signature.to_vec(),
+            },
+        ))
+    }
+
+    /// Parse [`MessageBlock::RelayIntro`].
+    fn parse_relay_intro(input: &[u8]) -> IResult<&[u8], Block, Ssu2ParseError> {
+        let (rest, _size) = be_u16(input)?;
+        let (rest, _flag) = be_u8(rest)?;
+        let (rest, router_hash) = take(ROUTER_HASH_LEN)(rest)?;
+
+        // keep track of message start so it can be sent unmodified to alice/charlie
+        //
+        // <https://i2p.net/en/docs/specs/ssu2/#relayintro>
+        let message_start = rest;
+
+        let (rest, nonce) = be_u32(rest)?;
+        let (rest, relay_tag) = be_u32(rest)?;
+        let (rest, _timestamp) = be_u32(rest)?;
+        let (rest, _version) = be_u8(rest)?;
+        let (rest, address_size) = be_u8(rest)?;
+        let (rest, address) = match address_size {
+            6 => {
+                let (rest, port) = be_u16(rest)?;
+                let (rest, address) = be_u32(rest)?;
+
+                (
+                    rest,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(address), port)),
+                )
+            }
+            18 => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "ipv6 not supported"
+                );
+                return Err(Err::Error(Ssu2ParseError::InvalidBitstream));
+            }
+            _ => return Err(Err::Error(Ssu2ParseError::InvalidBitstream)),
+        };
+        let (rest, signature) = take(ED25519_SIGNATURE_LEN)(rest)?;
+
+        Ok((
+            rest,
+            Block::RelayIntro {
+                router_id: RouterId::from(&router_hash),
+                address,
+                nonce,
+                relay_tag,
+                message: {
+                    let message_end =
+                        4usize // nonce
+                            .saturating_add(4) // relay tag
+                            .saturating_add(4) // timestamp
+                            .saturating_add(1) // version
+                            .saturating_add(1) // address size
+                            .saturating_add(address_size as usize);
+
+                    message_start[..message_end].to_vec()
+                },
+                signature: signature.to_vec(),
+            },
+        ))
+    }
+
+    /// Parse [`MessageBlock::RelayResponse`].
+    fn parse_relay_response(input: &[u8]) -> IResult<&[u8], Block, Ssu2ParseError> {
+        let (rest, size) = be_u16(input)?;
+        let (rest, _flag) = be_u8(rest)?;
+        let (rest, code) = be_u8(rest)?;
+
+        // keep track of message start so it can be sent unmodified to alice/charlie
+        //
+        // <https://i2p.net/en/docs/specs/ssu2/#relayresponse>
+        let message_start = rest;
+
+        let (rest, nonce) = be_u32(rest)?;
+        let (rest, _timestamp) = be_u32(rest)?;
+        let (rest, _version) = be_u8(rest)?;
+        let (rest, address_size) = be_u8(rest)?;
+        let (rest, address) = match address_size {
+            0 => (rest, None),
+            6 => {
+                let (rest, port) = be_u16(rest)?;
+                let (rest, address) = be_u32(rest)?;
+
+                (
+                    rest,
+                    Some(SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::from(address),
+                        port,
+                    ))),
+                )
+            }
+            18 => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "ipv6 not supported"
+                );
+                return Err(Err::Error(Ssu2ParseError::InvalidBitstream));
+            }
+            _ => return Err(Err::Error(Ssu2ParseError::InvalidBitstream)),
+        };
+        // attempt to parse signature, bob rejection responses do not have it
+        //
+        // 128 is an ambiguous code since we don't know who sent the message
+        // and technically the signature could be conditionally parsed by comparing
+        // current offset with message size but doesn't seem worth it
+        let (rest, signature) = match code {
+            1..=63 => (rest, None),
+            _ => {
+                let (rest, signature) = take(ED25519_SIGNATURE_LEN)(rest)?;
+
+                (rest, Some(signature.to_vec()))
+            }
+        };
+
+        // if there are bytes left in the message, extract token
+        let message_size = 4usize // nonce
+            .saturating_add(4) // timestamp
+            .saturating_add(1) // version
+            .saturating_add(1) // address size
+            .saturating_add(address_size as usize);
+
+        let (rest, token) = {
+            let left = (size as usize)
+                .saturating_sub(message_size)
+                .saturating_sub(2) // flag + code
+                .saturating_sub(signature.as_ref().map_or(0, |s| s.len()));
+
+            if left == TOKEN_LEN {
+                let (rest, token) = le_u64(rest)?;
+
+                (rest, Some(token))
+            } else {
+                (rest, None)
+            }
+        };
+
+        Ok((
+            rest,
+            Block::RelayResponse {
+                token,
+                rejection: (code != 0).then(|| RelayRejectionReason::from(code)),
+                address,
+                nonce,
+                message: message_start[..message_size].to_vec(),
+                signature,
+            },
+        ))
+    }
+
     /// Attempt to parse unsupported block from `input`
     fn parse_unsupported_block(input: &[u8]) -> IResult<&[u8], Block, Ssu2ParseError> {
         let (rest, size) = be_u16(input)?;
@@ -1064,6 +1338,10 @@ impl Block {
             Some(BlockType::Padding) => Self::parse_padding(rest),
             Some(BlockType::PeerTest) => Self::parse_peer_test(rest),
             Some(BlockType::Address) => Self::parse_address(rest),
+            Some(BlockType::RelayTagRequest) => Self::parse_relay_tag_request(rest),
+            Some(BlockType::RelayRequest) => Self::parse_relay_request(rest),
+            Some(BlockType::RelayIntro) => Self::parse_relay_intro(rest),
+            Some(BlockType::RelayResponse) => Self::parse_relay_response(rest),
             Some(block_type) => {
                 tracing::warn!(
                     target: LOG_TARGET,
@@ -1127,7 +1405,14 @@ impl Block {
                     IpAddr::V4(_) => 2usize + 4usize, // port + address
                     IpAddr::V6(_) => 2usize + 16usize, // port + address
                 },
-                block_type => todo!("unsupported block type: {block_type:?}"),
+                Block::RelayTag { .. } => 4, // relay tag (u32)
+                Block::RelayTagRequest => 0,
+                Block::RelayRequest { .. } => todo!("Block::RelayRequest"),
+                Block::RelayResponse { .. } => todo!("Block::RelayResponse"),
+                Block::RelayIntro { .. } => todo!("Block::RelayIntro"),
+                Block::PeerTest { .. } => todo!("Block::PeerTest"),
+                Block::NextNonce {  } => todo!("Block::NextNonce"),
+                Block::Unsupported => unreachable!(),
             }
     }
 
@@ -1194,6 +1479,12 @@ impl Block {
                 out.put_u8(reason);
                 out
             }
+            Self::RelayTag { relay_tag } => {
+                out.put_u8(BlockType::RelayTag.as_u8());
+                out.put_u16(4);
+                out.put_u32(relay_tag);
+                out
+            }
             block_type => todo!("unsupported block type: {block_type:?}"),
         }
     }
@@ -1249,7 +1540,7 @@ impl TryFrom<u8> for MessageType {
 
 /// Header kind.
 pub enum HeaderKind {
-    /// Retry
+    /// Retry.
     Retry {
         /// Network ID.
         net_id: u8,
@@ -1317,8 +1608,20 @@ pub enum HeaderKind {
         pkt_num: u32,
     },
 
-    /// Peer test
+    /// Peer test.
     PeerTest {
+        /// Network ID.
+        net_id: u8,
+
+        /// Packet number.
+        pkt_num: u32,
+
+        /// Source connection ID.
+        src_id: u64,
+    },
+
+    /// Hole punch
+    HolePunch {
         /// Network ID.
         net_id: u8,
 
@@ -1389,6 +1692,16 @@ impl fmt::Debug for HeaderKind {
                 src_id,
             } => f
                 .debug_struct("HeaderKind::PeerTest")
+                .field("net_id", &net_id)
+                .field("pkt_num", &pkt_num)
+                .field("src_id", &src_id)
+                .finish(),
+            Self::HolePunch {
+                net_id,
+                pkt_num,
+                src_id,
+            } => f
+                .debug_struct("HeaderKind::HolePunch")
                 .field("net_id", &net_id)
                 .field("pkt_num", &pkt_num)
                 .field("src_id", &src_id)
@@ -1612,13 +1925,28 @@ impl<'a> HeaderReader<'a> {
                     src_id,
                 })
             }
-            message_type => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    ?message_type,
-                    "unsupported message type",
+            MessageType::HolePunch => {
+                if ((header >> 40) as u8) != PROTOCOL_VERSION {
+                    return Err(Ssu2Error::InvalidVersion);
+                }
+
+                if self.pkt.len() < 32 {
+                    return Err(Ssu2Error::NotEnoughBytes);
+                }
+
+                ChaCha::with_iv(k_header_2, [0u8; 12]).decrypt_ref(&mut self.pkt[16..32]);
+
+                let net_id = ((header >> 48) & 0xff) as u8;
+                let pkt_num = u32::from_be(header as u32);
+                let src_id = u64::from_le_bytes(
+                    TryInto::<[u8; 8]>::try_into(&self.pkt[16..24]).expect("to succeed"),
                 );
-                Err(Ssu2Error::UnexpectedMessage)
+
+                Ok(HeaderKind::HolePunch {
+                    net_id,
+                    pkt_num,
+                    src_id,
+                })
             }
         }
     }
@@ -1717,7 +2045,7 @@ impl<'a> PeerTestBuilder<'a> {
             out.put_u8(self.net_id);
             out.put_u8(0u8); // flag
             out.put_u64_le(self.src_id.take().expect("to exist"));
-            out.put_u64(0u64);
+            out.put_u64(R::rng().next_u64());
 
             (out, pkt_num)
         };
@@ -1743,6 +2071,177 @@ impl<'a> PeerTestBuilder<'a> {
             payload.push(0); // code
             payload.push(0); // flag
             payload.extend_from_slice(self.message);
+        }
+        payload.extend_from_slice(&Block::Padding { padding }.serialize());
+
+        // must succeed since all the parameters are controlled by us
+        ChaChaPoly::with_nonce(&intro_key, pkt_num as u64)
+            .encrypt_with_ad_new(&header, &mut payload)
+            .expect("to succeed");
+
+        // encrypt first 16 bytes of the long header
+        //
+        // https://geti2p.net/spec/ssu2#header-encryption-kdf
+        payload[payload.len() - 2 * IV_SIZE..]
+            .chunks(IV_SIZE)
+            .zip(header.chunks_mut(8usize))
+            .zip([intro_key, intro_key])
+            .for_each(|((chunk, header_chunk), key)| {
+                ChaCha::with_iv(
+                    key,
+                    TryInto::<[u8; IV_SIZE]>::try_into(chunk).expect("to succeed"),
+                )
+                .decrypt([0u8; 8])
+                .iter()
+                .zip(header_chunk.iter_mut())
+                .for_each(|(mask_byte, header_byte)| {
+                    *header_byte ^= mask_byte;
+                });
+            });
+
+        // encrypt last 16 bytes of the header
+        ChaCha::with_iv(intro_key, [0u8; IV_SIZE]).encrypt_ref(&mut header[16..32]);
+
+        let mut out = BytesMut::with_capacity(LONG_HEADER_LEN + payload.len());
+        out.put_slice(&header);
+        out.put_slice(&payload);
+
+        out
+    }
+}
+
+/// Builder for `HolePunch`.
+pub struct HolePunchBuilder<'a> {
+    /// Address block.
+    address: Option<SocketAddr>,
+
+    /// Destination connection ID.
+    dst_id: Option<u64>,
+
+    /// Remote router's intro key.
+    intro_key: Option<[u8; 32]>,
+
+    /// Message.
+    message: &'a [u8],
+
+    /// Network ID.
+    ///
+    /// Defaults to 2.
+    net_id: u8,
+
+    /// Signature for `message`.
+    signature: &'a [u8],
+
+    /// Source connection ID.
+    src_id: Option<u64>,
+
+    /// Token for `SessionRequest`.
+    token: Option<u64>,
+}
+
+impl<'a> HolePunchBuilder<'a> {
+    /// Create new `HolePunchBuilder`.
+    pub fn new(message: &'a [u8], signature: &'a [u8]) -> Self {
+        Self {
+            address: None,
+            dst_id: None,
+            intro_key: None,
+            message,
+            net_id: 2u8,
+            signature,
+            src_id: None,
+            token: None,
+        }
+    }
+
+    /// Specify destination connection ID.
+    pub fn with_dst_id(mut self, dst_id: u64) -> Self {
+        self.dst_id = Some(dst_id);
+        self
+    }
+
+    /// Specify source connection ID.
+    pub fn with_src_id(mut self, src_id: u64) -> Self {
+        self.src_id = Some(src_id);
+        self
+    }
+
+    /// Specify token.
+    pub fn with_token(mut self, token: u64) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    /// Specify remote router's intro key.
+    pub fn with_intro_key(mut self, intro_key: [u8; 32]) -> Self {
+        self.intro_key = Some(intro_key);
+        self
+    }
+
+    /// Specify network ID.
+    pub fn with_net_id(mut self, net_id: u8) -> Self {
+        self.net_id = net_id;
+        self
+    }
+
+    /// Specfy address.
+    pub fn with_addres(mut self, address: SocketAddr) -> Self {
+        self.address = Some(address);
+        self
+    }
+
+    /// Build [`HolePunchBuilder`] into a byte vector.
+    pub fn build<R: Runtime>(mut self) -> BytesMut {
+        let intro_key = self.intro_key.take().expect("to exist");
+        let mut rng = R::rng();
+        let padding = {
+            let padding_len = rng.next_u32() % MAX_PADDING as u32 + 8;
+            let mut padding = vec![0u8; padding_len as usize];
+            rng.fill_bytes(&mut padding);
+
+            padding
+        };
+
+        let (mut header, pkt_num) = {
+            let mut out = BytesMut::with_capacity(LONG_HEADER_LEN);
+            let pkt_num = rng.next_u32();
+
+            out.put_u64_le(self.dst_id.take().expect("to exist"));
+            out.put_u32(pkt_num);
+            out.put_u8(*MessageType::HolePunch);
+            out.put_u8(2u8); // version
+            out.put_u8(self.net_id);
+            out.put_u8(0u8); // flag
+            out.put_u64_le(self.src_id.take().expect("to exist"));
+            out.put_u64(R::rng().next_u64());
+
+            (out, pkt_num)
+        };
+
+        let mut payload = Vec::with_capacity(10 + padding.len() + POLY13055_MAC_LEN);
+        payload.extend_from_slice(
+            &Block::DateTime {
+                timestamp: R::time_since_epoch().as_secs() as u32,
+            }
+            .serialize(),
+        );
+        if let Some(address) = self.address.take() {
+            payload.extend_from_slice(&Block::Address { address }.serialize());
+        }
+        // create relay response block
+        //
+        // TODO: not good
+        {
+            // flag + code + message + signature + token
+            let size = (1 + 1 + self.message.len() + self.signature.len() + 8) as u16;
+
+            payload.push(BlockType::RelayResponse.as_u8());
+            payload.extend_from_slice({ size }.to_be_bytes().as_ref());
+            payload.push(0u8); // flag
+            payload.push(0u8); // code (accept)
+            payload.extend_from_slice(self.message);
+            payload.extend_from_slice(self.signature);
+            payload.extend_from_slice(&self.token.expect("to exist").to_le_bytes());
         }
         payload.extend_from_slice(&Block::Padding { padding }.serialize());
 

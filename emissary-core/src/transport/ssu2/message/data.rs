@@ -22,7 +22,10 @@ use crate::{
     primitives::RouterId,
     runtime::Runtime,
     transport::{
-        ssu2::{message::*, peer_test::types::RejectionReason, session::KeyContext},
+        ssu2::{
+            message::*, peer_test::types::RejectionReason as PeerTestRejectionReason,
+            relay::types::RejectionReason as RelayRejectionReason, session::KeyContext,
+        },
         TerminationReason,
     },
 };
@@ -31,6 +34,7 @@ use bytes::{BufMut, BytesMut};
 use rand::Rng;
 
 use alloc::{format, vec, vec::Vec};
+use core::fmt;
 
 /// Minimum size for an ACK block.
 const ACK_BLOCK_MIN_SIZE: usize = 8usize;
@@ -91,6 +95,15 @@ pub enum MessageKind<'a> {
         router_info: Option<&'a [u8]>,
     },
 
+    /// Relay block.
+    Relay {
+        /// Relay block.
+        relay_block: &'a RelayBlock,
+
+        /// Serialized `RouterInfo`.
+        router_info: Option<&'a [u8]>,
+    },
+
     /// Router info block.
     RouterInfo {
         /// Serialized `RouterInfo`.
@@ -112,7 +125,7 @@ pub enum PeerTestBlock {
     /// Bob rejected Alice's peer test request.
     BobReject {
         /// Rejection reason.
-        reason: RejectionReason,
+        reason: PeerTestRejectionReason,
 
         /// Message.
         ///
@@ -144,7 +157,7 @@ pub enum PeerTestBlock {
         /// Rejection reason.
         ///
         /// `None` if Charlie accepted the peer test request.
-        rejection: Option<RejectionReason>,
+        rejection: Option<PeerTestRejectionReason>,
     },
 
     /// Relay Charlie's response to Alice's request as Bob.
@@ -155,7 +168,7 @@ pub enum PeerTestBlock {
         /// Rejection reason.
         ///
         /// `None` if Charlie accepted the peer test request.
-        rejection: Option<RejectionReason>,
+        rejection: Option<PeerTestRejectionReason>,
 
         /// Router ID of Charlie.
         router_id: RouterId,
@@ -192,7 +205,6 @@ impl fmt::Debug for PeerTestBlock {
     }
 }
 
-#[allow(unused)]
 impl PeerTestBlock {
     /// Get serialized length of the block.
     pub fn serialized_len(&self) -> usize {
@@ -206,6 +218,81 @@ impl PeerTestBlock {
             Self::CharlieResponse { message, .. } => overhead + message.len(),
             Self::RelayCharlieResponse { message, .. } =>
                 overhead + message.len() + ROUTER_HASH_LEN,
+        }
+    }
+}
+
+/// Relay block.
+pub enum RelayBlock {
+    /// Relay response from Bob or Charlie.
+    Response {
+        /// Rejection reason.
+        ///
+        /// `None` if accepted.
+        rejection: Option<RelayRejectionReason>,
+
+        /// Message.
+        message: Vec<u8>,
+
+        /// Signature for `message`.
+        ///
+        /// `None` if rejected by Bob.
+        signature: Option<Vec<u8>>,
+
+        /// Token.
+        ///
+        /// `None` if rejected by Bob/Charlie.
+        token: Option<u64>,
+    },
+
+    /// Relay intro from Bob to Charlie.
+    Intro {
+        /// Alice's router info.
+        router_id: Vec<u8>,
+
+        /// Message received from Alice.
+        message: Vec<u8>,
+
+        /// Signature for `message`.
+        signature: Vec<u8>,
+    },
+}
+
+impl RelayBlock {
+    /// Get serialized length of the block.
+    pub fn serialized_len(&self) -> usize {
+        // block type + block length + flag;
+        let overhead = 1 + 2 + 1;
+
+        match self {
+            Self::Response {
+                message,
+                signature,
+                token,
+                rejection: _,
+            } =>
+                overhead
+                    + 1
+                    + message.len()
+                    + signature.as_ref().map_or(0, |s| s.len())
+                    + token.map_or(0, |_| TOKEN_LEN),
+            Self::Intro {
+                message,
+                signature,
+                router_id: _,
+            } => overhead + ROUTER_HASH_LEN + message.len() + signature.len(),
+        }
+    }
+}
+
+impl fmt::Debug for RelayBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Response { rejection, .. } => f
+                .debug_struct("RelayBlock::Response")
+                .field("rejection", &rejection)
+                .finish_non_exhaustive(),
+            Self::Intro { .. } => f.debug_struct("RelayBlock::Intro").finish_non_exhaustive(),
         }
     }
 }
@@ -428,6 +515,60 @@ impl<'a> DataMessageBuilder<'a> {
                             out.put_u8(0u8); // flag
                             out.put_slice(&router_id.to_vec());
                             out.put_slice(message);
+                        }
+                    }
+                }
+                Some(MessageKind::Relay {
+                    relay_block,
+                    router_info,
+                }) => {
+                    if let Some(router_info) = router_info {
+                        out.put_u8(BlockType::RouterInfo.as_u8());
+                        out.put_u16((2 + router_info.len()) as u16);
+                        out.put_u8(0u8);
+                        out.put_u8(1u8);
+                        out.put_slice(router_info);
+                    }
+
+                    match relay_block {
+                        RelayBlock::Response {
+                            rejection,
+                            message,
+                            signature,
+                            token,
+                        } => {
+                            out.put_u8(BlockType::RelayResponse.as_u8());
+                            out.put_u16(
+                                (2 + message.len()
+                                    + signature.as_ref().map_or(0, |s| s.len())
+                                    + token.map_or(0, |_| TOKEN_LEN))
+                                    as u16,
+                            );
+                            out.put_u8(0);
+                            out.put_u8(rejection.map_or(0, |reason| reason.as_u8()));
+                            out.put_slice(message);
+
+                            if let Some(signature) = signature {
+                                out.put_slice(signature);
+                            }
+
+                            if let Some(token) = token {
+                                out.put_u64_le(*token);
+                            }
+                        }
+                        RelayBlock::Intro {
+                            router_id,
+                            message,
+                            signature,
+                        } => {
+                            out.put_u8(BlockType::RelayIntro.as_u8());
+                            out.put_u16(
+                                (1 + ROUTER_HASH_LEN + message.len() + signature.len()) as u16,
+                            );
+                            out.put_u8(0); // flag
+                            out.put_slice(router_id);
+                            out.put_slice(message);
+                            out.put_slice(signature);
                         }
                     }
                 }

@@ -29,6 +29,7 @@ use crate::{
             message::{HeaderKind, HeaderReader},
             metrics::*,
             peer_test::{PeerTestManager, PeerTestManagerEvent},
+            relay::{types::RelayTagRequested, RelayManager},
             session::{
                 active::{Ssu2Session, Ssu2SessionContext},
                 pending::{
@@ -46,7 +47,7 @@ use crate::{
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use rand::Rng;
 use thingbuf::mpsc::{channel, errors::TrySendError, Sender};
 
@@ -90,6 +91,9 @@ enum PendingSessionKind {
         /// This is the connection ID selected by the remote router and is used to remove pending
         /// session context in case it's rejected by the `TransportManager`.
         dst_id: u64,
+
+        /// Relay tag request during handshake.
+        relay_tag_request: RelayTagRequested,
 
         /// Key for decrypting the header of `SessionConfirmed` message.
         k_header_2: [u8; 32],
@@ -197,6 +201,9 @@ pub struct Ssu2Socket<R: Runtime> {
     /// Datagram read buffer.
     read_buffer: Vec<u8>,
 
+    /// Relay manager.
+    relay_manager: RelayManager<R>,
+
     /// Router context.
     router_ctx: RouterContext<R>,
 
@@ -211,6 +218,9 @@ pub struct Ssu2Socket<R: Runtime> {
 
     /// Terminating sessions.
     terminating_session: R::JoinSet<(RouterId, u64)>,
+
+    /// Tokens.
+    tokens: HashSet<u64>,
 
     /// TX channel for sending events to `SubsystemManager`.
     #[allow(unused)]
@@ -255,11 +265,13 @@ impl<R: Runtime> Ssu2Socket<R> {
             pending_pkts: VecDeque::new(),
             pending_sessions: R::join_set(),
             read_buffer: vec![0u8; DATAGRAM_MAX_SIZE],
+            relay_manager: RelayManager::new(router_ctx.clone(), socket.clone()),
             router_ctx,
             sessions: HashMap::new(),
             socket,
             static_key,
             terminating_session: R::join_set(),
+            tokens: HashSet::new(),
             transport_tx,
             unvalidated_sessions: HashMap::new(),
             waker: None,
@@ -320,6 +332,7 @@ impl<R: Runtime> Ssu2Socket<R> {
                 }
 
                 let (tx, rx) = channel(CHANNEL_SIZE);
+                let relay_tag = self.relay_manager.allocate_relay_tag();
                 let session = InboundSsu2Session::<R>::new(InboundSsu2Context {
                     address,
                     chaining_key: self.chaining_key.clone(),
@@ -328,6 +341,7 @@ impl<R: Runtime> Ssu2Socket<R> {
                     net_id: self.router_ctx.net_id(),
                     pkt: datagram,
                     pkt_num,
+                    relay_tag,
                     rx,
                     socket: self.socket.clone(),
                     src_id,
@@ -339,7 +353,7 @@ impl<R: Runtime> Ssu2Socket<R> {
                 self.pending_sessions.push(session.run());
                 self.router_ctx.metrics_handle().counter(NUM_INBOUND_SSU2).increment(1);
 
-                Ok(None)
+                return Ok(None);
             }
             Ok(HeaderKind::PeerTest {
                 net_id,
@@ -365,53 +379,88 @@ impl<R: Runtime> Ssu2Socket<R> {
                             "failed to handle out-of-session peer test message",
                         );
 
-                        Err(error)
+                        return Err(error);
                     }
-                    Ok(None) => Ok(None),
-                    Ok(Some(PeerTestManagerEvent::PeerTestResult { results })) => Ok(results
-                        .into_iter()
-                        .fold(None, |prev, result| {
-                            match (
-                                prev,
-                                self.detector.add_peer_test_result(result.0, result.1, result.2),
-                            ) {
-                                (None, None) => None,
-                                (None, Some(event)) => Some(event),
-                                (Some(_), Some(event)) => Some(event),
-                                (Some(event), None) => Some(event),
-                            }
-                        })
-                        .map(|status| TransportEvent::FirewallStatus { status })),
+                    Ok(None) => return Ok(None),
+                    Ok(Some(PeerTestManagerEvent::PeerTestResult { results })) =>
+                        return Ok(results
+                            .into_iter()
+                            .fold(None, |prev, result| {
+                                match (
+                                    prev,
+                                    self.detector
+                                        .add_peer_test_result(result.0, result.1, result.2),
+                                ) {
+                                    (None, None) => None,
+                                    (None, Some(event)) => Some(event),
+                                    (Some(_), Some(event)) => Some(event),
+                                    (Some(event), None) => Some(event),
+                                }
+                            })
+                            .map(|status| TransportEvent::FirewallStatus { status })),
                 }
             }
-            _ => match self.pending_outbound.get(&address) {
-                Some(intro_key) =>
-                    match self.sessions.get_mut(&reader.reset_key(*intro_key).dst_id()) {
-                        Some(tx) => tx
-                            .try_send(Packet {
-                                pkt: datagram,
-                                address,
-                            })
-                            .map(|_| None)
-                            .map_err(From::from),
-                        None => {
-                            tracing::debug!(
-                                target: LOG_TARGET,
-                                ?address,
-                                "pending connection found but no associated session",
-                            );
-                            Ok(None)
-                        }
+            Ok(HeaderKind::SessionRequest {
+                token,
+                pkt_num,
+                ephemeral_key,
+                ..
+            }) if self.tokens.remove(&token) => {
+                let (tx, rx) = channel(CHANNEL_SIZE);
+                let relay_tag = self.relay_manager.allocate_relay_tag();
+                let session = InboundSsu2Session::<R>::from_token_request(
+                    InboundSsu2Context {
+                        address,
+                        chaining_key: self.chaining_key.clone(),
+                        dst_id: connection_id,
+                        intro_key: self.intro_key,
+                        net_id: self.router_ctx.net_id(),
+                        pkt: datagram,
+                        pkt_num,
+                        relay_tag,
+                        rx,
+                        socket: self.socket.clone(),
+                        src_id: !connection_id,
+                        state: self.inbound_state.clone(),
+                        static_key: self.static_key.clone(),
                     },
-                None => {
-                    tracing::trace!(
-                        target: LOG_TARGET,
-                        message_type = ?datagram.get(12),
-                        "unrecognized message type",
-                    );
-                    Err(Ssu2Error::Malformed)
-                }
-            },
+                    ephemeral_key,
+                    token,
+                );
+
+                self.sessions.insert(connection_id, tx);
+                self.pending_sessions.push(session.run());
+
+                return Ok(None);
+            }
+            _ => {}
+        }
+
+        let Some(intro_key) = self.pending_outbound.get(&address) else {
+            tracing::error!(
+                target: "emissary::ssu2::relay",
+                message_type = ?datagram.get(12),
+                "unrecognized message type",
+            );
+            return Err(Ssu2Error::Malformed);
+        };
+
+        match self.sessions.get_mut(&reader.reset_key(*intro_key).dst_id()) {
+            Some(tx) => tx
+                .try_send(Packet {
+                    pkt: datagram,
+                    address,
+                })
+                .map(|_| None)
+                .map_err(From::from),
+            None => {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    ?address,
+                    "pending connection found but no associated session",
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -492,11 +541,12 @@ impl<R: Runtime> Ssu2Socket<R> {
             return;
         };
 
-        let context = match kind {
+        let (context, relay_tag_request) = match kind {
             PendingSessionKind::Inbound {
                 pkt,
                 address,
                 context,
+                relay_tag_request,
                 ..
             } => {
                 tracing::trace!(
@@ -508,7 +558,8 @@ impl<R: Runtime> Ssu2Socket<R> {
 
                 // TODO: retransmissiosn?
                 self.pending_pkts.push_back((pkt, address));
-                context
+
+                (context, Some(relay_tag_request))
             }
             PendingSessionKind::Outbound {
                 address, context, ..
@@ -521,15 +572,28 @@ impl<R: Runtime> Ssu2Socket<R> {
                 );
 
                 self.pending_outbound.remove(&address);
-                context
+
+                (context, None)
             }
         };
 
-        // get handle to peer test manager.
-        let handle = self.peer_test_manager.handle();
+        // get handles to `PeerTestManager` and `RelayManager`
+        let peer_test_handle = self.peer_test_manager.handle();
+        let relay_handle = self.relay_manager.handle();
+
+        match relay_tag_request {
+            Some(RelayTagRequested::Yes(tag)) => self.relay_manager.register_relay_client(
+                router_id.clone(),
+                tag,
+                relay_handle.cmd_tx(),
+            ),
+            Some(RelayTagRequested::No(tag)) => self.relay_manager.deallocate_relay_tag(tag),
+            None => {}
+        }
 
         // register session to `PeerTestManager`
-        self.peer_test_manager.add_session(&context.router_id, handle.cmd_tx());
+        self.peer_test_manager
+            .add_session(&context.router_id, peer_test_handle.cmd_tx());
 
         self.active_sessions.push(
             Ssu2Session::<R>::new(
@@ -537,7 +601,8 @@ impl<R: Runtime> Ssu2Socket<R> {
                 self.socket.clone(),
                 self.transport_tx.clone(),
                 self.router_ctx.clone(),
-                handle,
+                peer_test_handle,
+                relay_handle,
             )
             .run(),
         );
@@ -564,6 +629,7 @@ impl<R: Runtime> Ssu2Socket<R> {
             PendingSessionKind::Inbound {
                 context,
                 k_header_2,
+                relay_tag_request,
                 ..
             } => {
                 tracing::debug!(
@@ -572,6 +638,7 @@ impl<R: Runtime> Ssu2Socket<R> {
                     connection_id = ?context.dst_id,
                     "inbound session rejected, send termination",
                 );
+                self.relay_manager.deallocate_relay_tag(relay_tag_request.tag());
 
                 let Ssu2SessionContext {
                     address,
@@ -685,6 +752,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                 );
 
                 this.peer_test_manager.remove_session(&router_id);
+                this.relay_manager.register_closed_connection(&router_id);
                 this.terminating_session.push(TerminatingSsu2Session::<R>::new(termination_ctx));
                 this.router_ctx.metrics_handle().gauge(NUM_CONNECTIONS).decrement(1);
 
@@ -743,6 +811,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                             k_header_2,
                             router_info,
                             serialized,
+                            relay_tag_request,
                             ..
                         } => {
                             let router_id = context.router_id.clone();
@@ -770,6 +839,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                                             context,
                                             dst_id,
                                             k_header_2,
+                                            relay_tag_request,
                                         },
                                     );
 
@@ -826,6 +896,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                             if let Some(address) = external_address {
                                 if let Some(address) = this.detector.add_external_address(address) {
                                     this.peer_test_manager.add_external_address(address);
+                                    this.relay_manager.add_external_address(address);
                                 }
                             }
 
@@ -838,47 +909,52 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                             address,
                             connection_id,
                             router_id,
+                            relay_tag,
                             ..
-                        } => match router_id {
-                            None => {
+                        } => {
+                            if let Some(tag) = relay_tag {
+                                this.relay_manager.deallocate_relay_tag(tag);
+                            }
+
+                            let Some(router_id) = router_id else {
                                 tracing::debug!(
                                     target: LOG_TARGET,
                                     ?connection_id,
                                     "pending inbound session terminated",
                                 );
                                 debug_assert!(false);
-                            }
-                            Some(router_id) => {
-                                tracing::debug!(
-                                    target: LOG_TARGET,
-                                    %router_id,
-                                    ?connection_id,
-                                    "pending outbound session terminated",
-                                );
-                                let _channel = this.sessions.remove(&connection_id);
-                                debug_assert!(_channel.is_some());
+                                continue;
+                            };
 
-                                match address {
-                                    Some(address) => {
-                                        let _key = this.pending_outbound.remove(&address);
-                                        debug_assert!(_key.is_some());
-                                    }
-                                    None => {
-                                        tracing::warn!(
-                                            target: LOG_TARGET,
-                                            %router_id,
-                                            %connection_id,
-                                            "address doens't exist for a terminated outbound connection",
-                                        );
-                                        debug_assert!(false);
-                                    }
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                %router_id,
+                                ?connection_id,
+                                "pending outbound session terminated",
+                            );
+                            let _channel = this.sessions.remove(&connection_id);
+                            debug_assert!(_channel.is_some());
+
+                            match address {
+                                Some(address) => {
+                                    let _key = this.pending_outbound.remove(&address);
+                                    debug_assert!(_key.is_some());
                                 }
-
-                                return Poll::Ready(Some(TransportEvent::ConnectionFailure {
-                                    router_id,
-                                }));
+                                None => {
+                                    tracing::warn!(
+                                        target: LOG_TARGET,
+                                        %router_id,
+                                        %connection_id,
+                                        "address doens't exist for a terminated outbound connection",
+                                    );
+                                    debug_assert!(false);
+                                }
                             }
-                        },
+
+                            return Poll::Ready(Some(TransportEvent::ConnectionFailure {
+                                router_id,
+                            }));
+                        }
                         PendingSsu2SessionStatus::Timeout {
                             connection_id,
                             router_id,
@@ -962,6 +1038,16 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
             }
         }
 
+        loop {
+            match this.relay_manager.poll_next_unpin(cx) {
+                Poll::Pending => break,
+                Poll::Ready(None) => {}
+                Poll::Ready(Some(token)) => {
+                    this.tokens.insert(token);
+                }
+            }
+        }
+
         self.waker = Some(cx.waker().clone());
         Poll::Pending
     }
@@ -1034,14 +1120,16 @@ mod tests {
             },
             verifying_key: SigningPublicKey::from_bytes(&[0x22; 32]).unwrap(),
         };
-        let handle = socket.peer_test_manager.handle();
+        let peer_test_handle = socket.peer_test_manager.handle();
+        let relay_handle = socket.relay_manager.handle();
         socket.active_sessions.push(
             Ssu2Session::<MockRuntime>::new(
                 context,
                 udp_socket,
                 socket.transport_tx.clone(),
                 socket.router_ctx.clone(),
-                handle,
+                peer_test_handle,
+                relay_handle,
             )
             .run(),
         );
