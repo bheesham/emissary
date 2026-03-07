@@ -29,7 +29,9 @@ use crate::{
             message::{HeaderKind, HeaderReader},
             metrics::*,
             peer_test::{PeerTestManager, PeerTestManagerEvent},
-            relay::{types::RelayTagRequested, RelayManager},
+            relay::{
+                types::RelayTagRequested, RelayManager, RelayManagerEvent, INTRODUCER_EXPIRATION,
+            },
             session::{
                 active::{Ssu2Session, Ssu2SessionContext},
                 pending::{
@@ -41,7 +43,7 @@ use crate::{
             },
             Packet,
         },
-        Direction, TerminationReason, TransportEvent,
+        Direction, FirewallStatus, TerminationReason, TransportEvent,
     },
 };
 
@@ -107,6 +109,9 @@ enum PendingSessionKind {
         /// Session context.
         context: Ssu2SessionContext,
 
+        /// Relay tag, if we requested and received one.
+        relay_tag: Option<u32>,
+
         /// Source connection ID.
         ///
         /// This is the connection ID selected by us which the remote router uses to send us
@@ -133,12 +138,14 @@ impl fmt::Debug for PendingSessionKind {
             PendingSessionKind::Outbound {
                 address,
                 context,
+                relay_tag,
                 src_id,
             } => f
                 .debug_struct("PendingSessionKind::Outbound")
                 .field("address", &address)
                 .field("dst_id", &context.dst_id)
                 .field("src_id", &src_id)
+                .field("relay_tag", &relay_tag)
                 .finish_non_exhaustive(),
         }
     }
@@ -186,6 +193,9 @@ pub struct Ssu2Socket<R: Runtime> {
 
     /// Peer test manager.
     peer_test_manager: PeerTestManager<R>,
+
+    /// Pending events.
+    pending_events: VecDeque<TransportEvent>,
 
     /// Pending outbound sessions.
     ///
@@ -256,11 +266,12 @@ impl<R: Runtime> Ssu2Socket<R> {
         Self {
             active_sessions: R::join_set(),
             chaining_key: Bytes::from(chaining_key),
-            inbound_state: Bytes::from(inbound_state),
             detector: Detector::new(),
+            inbound_state: Bytes::from(inbound_state),
             intro_key,
             outbound_state: Bytes::from(outbound_state),
             peer_test_manager: PeerTestManager::new(intro_key, socket.clone(), router_ctx.clone()),
+            pending_events: VecDeque::new(),
             pending_outbound: HashMap::new(),
             pending_pkts: VecDeque::new(),
             pending_sessions: R::join_set(),
@@ -437,8 +448,8 @@ impl<R: Runtime> Ssu2Socket<R> {
         }
 
         let Some(intro_key) = self.pending_outbound.get(&address) else {
-            tracing::error!(
-                target: "emissary::ssu2::relay",
+            tracing::debug!(
+                target: LOG_TARGET,
                 message_type = ?datagram.get(12),
                 "unrecognized message type",
             );
@@ -464,18 +475,20 @@ impl<R: Runtime> Ssu2Socket<R> {
         }
     }
 
+    /// Attempt to establish outbound connection remote router.
     pub fn connect(&mut self, router_info: RouterInfo) {
         // must succeed since `TransportManager` has ensured `router_info` contains
         // a valid and reachable ssu2 router address
         let router_id = router_info.identity.id();
         let verifying_key = router_info.identity.signing_key().clone();
-
-        let Some(RouterAddress::Ssu2 {
-            static_key,
-            intro_key,
-            socket_address: Some(address),
-            ..
-        }) = router_info.ssu2_ipv4()
+        let Some(
+            ssu2_address @ RouterAddress::Ssu2 {
+                static_key,
+                intro_key,
+                socket_address: Some(address),
+                ..
+            },
+        ) = router_info.ssu2_ipv4()
         else {
             panic!("introducer support not implemented");
         };
@@ -509,15 +522,18 @@ impl<R: Runtime> Ssu2Socket<R> {
                 local_static_key: self.static_key.clone(),
                 net_id: self.router_ctx.net_id(),
                 remote_intro_key: *intro_key,
+                request_tag: core::matches!(self.detector.status(), FirewallStatus::Firewalled)
+                    && ssu2_address.supports_relay()
+                    && self.relay_manager.needs_introducers(),
                 router_id,
                 router_info: our_router_info,
                 rx,
-                verifying_key,
                 socket: self.socket.clone(),
                 src_id,
                 state,
                 static_key: static_key.clone(),
                 transport_tx,
+                verifying_key,
             })
             .run(),
         );
@@ -543,7 +559,11 @@ impl<R: Runtime> Ssu2Socket<R> {
             return;
         };
 
-        let (context, relay_tag_request) = match kind {
+        // get handles to `PeerTestManager` and `RelayManager`
+        let peer_test_handle = self.peer_test_manager.handle();
+        let relay_handle = self.relay_manager.handle();
+
+        let context = match kind {
             PendingSessionKind::Inbound {
                 pkt,
                 address,
@@ -561,10 +581,23 @@ impl<R: Runtime> Ssu2Socket<R> {
                 // TODO: retransmissiosn?
                 self.pending_pkts.push_back((pkt, address));
 
-                (context, Some(relay_tag_request))
+                // register relay client to `RelayManager`
+                match relay_tag_request {
+                    RelayTagRequested::Yes(tag) => self.relay_manager.register_relay_client(
+                        router_id.clone(),
+                        tag,
+                        relay_handle.cmd_tx(),
+                    ),
+                    RelayTagRequested::No(tag) => self.relay_manager.deallocate_relay_tag(tag),
+                }
+
+                context
             }
             PendingSessionKind::Outbound {
-                address, context, ..
+                address,
+                context,
+                relay_tag,
+                ..
             } => {
                 tracing::trace!(
                     target: LOG_TARGET,
@@ -575,23 +608,19 @@ impl<R: Runtime> Ssu2Socket<R> {
 
                 self.pending_outbound.remove(&address);
 
-                (context, None)
+                // register relay server to `RelayManager`
+                if let Some(relay_tag) = relay_tag {
+                    self.relay_manager.register_relay_server(context.router_id.clone(), relay_tag);
+                    self.pending_events.push_back(TransportEvent::IntroducerAdded {
+                        relay_tag,
+                        router_id: context.router_id.clone(),
+                        expires: R::time_since_epoch() + INTRODUCER_EXPIRATION,
+                    });
+                }
+
+                context
             }
         };
-
-        // get handles to `PeerTestManager` and `RelayManager`
-        let peer_test_handle = self.peer_test_manager.handle();
-        let relay_handle = self.relay_manager.handle();
-
-        match relay_tag_request {
-            Some(RelayTagRequested::Yes(tag)) => self.relay_manager.register_relay_client(
-                router_id.clone(),
-                tag,
-                relay_handle.cmd_tx(),
-            ),
-            Some(RelayTagRequested::No(tag)) => self.relay_manager.deallocate_relay_tag(tag),
-            None => {}
-        }
 
         // register session to `PeerTestManager`
         self.peer_test_manager
@@ -673,6 +702,7 @@ impl<R: Runtime> Ssu2Socket<R> {
                 address,
                 context,
                 src_id,
+                ..
             } => {
                 tracing::debug!(
                     target: LOG_TARGET,
@@ -695,6 +725,10 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
+
+        if let Some(event) = this.pending_events.pop_front() {
+            return Poll::Ready(Some(event));
+        }
 
         loop {
             match Pin::new(&mut this.socket).poll_recv_from(cx, &mut this.read_buffer) {
@@ -754,7 +788,11 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                 );
 
                 this.peer_test_manager.remove_session(&router_id);
-                this.relay_manager.register_closed_connection(&router_id);
+                if this.relay_manager.register_closed_connection(&router_id) {
+                    this.pending_events.push_back(TransportEvent::IntroducerRemoved {
+                        router_id: router_id.clone(),
+                    })
+                }
                 this.terminating_session.push(TerminatingSsu2Session::<R>::new(termination_ctx));
                 this.router_ctx.metrics_handle().gauge(NUM_CONNECTIONS).decrement(1);
 
@@ -866,6 +904,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                             src_id,
                             started: _,
                             external_address,
+                            relay_tag,
                         } => {
                             let router_id = context.router_id.clone();
 
@@ -882,6 +921,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                                     address: context.address,
                                     context,
                                     src_id,
+                                    relay_tag,
                                 },
                             ) {
                                 tracing::warn!(
@@ -1044,9 +1084,11 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
             match this.relay_manager.poll_next_unpin(cx) {
                 Poll::Pending => break,
                 Poll::Ready(None) => {}
-                Poll::Ready(Some(token)) => {
+                Poll::Ready(Some(RelayManagerEvent::SessionRequestToken { token })) => {
                     this.tokens.insert(token);
                 }
+                Poll::Ready(Some(RelayManagerEvent::IntroducerExpired { router_id })) =>
+                    return Poll::Ready(Some(TransportEvent::IntroducerRemoved { router_id })),
             }
         }
 
@@ -1057,8 +1099,6 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::{
         crypto::SigningPublicKey,
@@ -1070,6 +1110,7 @@ mod tests {
         subsystem::OutboundMessage,
         transport::ssu2::session::KeyContext,
     };
+    use std::time::Duration;
 
     #[tokio::test(start_paused = true)]
     async fn session_terminated() {
