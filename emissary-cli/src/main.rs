@@ -55,9 +55,6 @@ mod tools;
 mod tunnel;
 mod ui;
 
-#[cfg(all(feature = "native-ui", feature = "web-ui"))]
-compile_error!("native and web ui cannot be enabled at the same time");
-
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary";
 
@@ -399,7 +396,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "web-ui")]
+#[cfg(all(feature = "web-ui", not(feature = "native-ui")))]
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let (shutdown_tx, shutdown_rx) = channel(1);
@@ -432,7 +429,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// A main function which should be run within an async context.
-#[cfg(feature = "native-ui")]
+#[cfg(all(feature = "native-ui", not(feature = "web-ui")))]
 async fn native_main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = channel(1);
     let arguments = parse_arguments().await;
@@ -468,8 +465,68 @@ async fn native_main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(feature = "native-ui")]
+#[cfg(all(feature = "native-ui", not(feature = "web-ui")))]
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(native_main())
+}
+
+#[cfg(all(feature = "native-ui", feature = "web-ui"))]
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let (shutdown_tx, shutdown_rx) = channel(1);
+    let arguments = parse_arguments().await;
+    let RouterContext {
+        router,
+        port_mapper,
+        events,
+        router_ui_config,
+        config,
+        base_path,
+        address_book_handle,
+        router_id,
+        ..
+    } = setup_router::<TokioRuntime>(arguments).await?;
+
+    let use_web_ui = router_ui_config.as_ref().and_then(|c| c.web_ui).unwrap_or(false);
+
+    if use_web_ui {
+        match router_ui_config {
+            None => {
+                router_event_loop(router, port_mapper, shutdown_rx).await;
+            }
+            Some(RouterUiConfig {
+                refresh_interval,
+                port,
+                ..
+            }) => {
+                tokio::spawn(async move {
+                    ui::web::RouterUi::new(events, port, refresh_interval, shutdown_tx).run().await;
+                });
+                router_event_loop(router, port_mapper, shutdown_rx).await;
+            }
+        }
+    } else {
+        match router_ui_config {
+            None => {
+                router_event_loop(router, port_mapper, shutdown_rx).await;
+            }
+            Some(RouterUiConfig { .. }) => {
+                tokio::spawn(async move {
+                    router_event_loop(router, port_mapper, shutdown_rx).await;
+                    std::process::exit(0);
+                });
+                ui::native::RouterUi::start(
+                    events,
+                    config,
+                    base_path,
+                    address_book_handle,
+                    router_id,
+                    shutdown_tx,
+                )?
+            }
+        }
+    }
+
+    Ok(())
 }
