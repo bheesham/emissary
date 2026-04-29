@@ -24,7 +24,7 @@ jobs:
         run: cargo build --release --no-default-features --features web-ui
 
       - name: Upload release to GitHub
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/release/emissary-cli.exe
           draft: true
